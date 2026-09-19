@@ -2,6 +2,16 @@ File_Utilities :: #import "File_Utilities";
 
 GENERATOR_SOURCE_DIRECTORY :: #filepath;
 GENERATOR_REPOSITORY_URL :: "https://github.com/Jai-Ports/generator.git";
+#if OS == .LINUX {
+    GENERATOR_JAI_EXECUTABLE :: "jai-linux";
+} else #if OS == .MACOS {
+    GENERATOR_JAI_EXECUTABLE :: "jai-macos";
+} else #if OS == .WINDOWS {
+    GENERATOR_JAI_EXECUTABLE :: "jai.exe";
+} else {
+    GENERATOR_JAI_EXECUTABLE :: "";
+    #assert(false, "the generator requires a desktop Jai compiler");
+}
 GENERATOR_INPUT_SUBMODULES :: string.[
     "src/tbx/transpiler",
     "src/tbx/arena",
@@ -186,7 +196,7 @@ generator_repository_root :: () -> string {
     return root;
 }
 
-generator_generation_input_status :: (root: string) -> string {
+generator_repository_input_status :: (root: string) -> string {
     return generator_run_capture(
         string.[
             "git", "-C", root, "status", "--porcelain",
@@ -196,6 +206,42 @@ generator_generation_input_status :: (root: string) -> string {
         root,
         "inspect generator inputs",
     );
+}
+
+generator_append_status_section :: (
+    builder: *String_Builder,
+    label: string,
+    status: string,
+) {
+    if !status.count return;
+    append(builder, label);
+    append(builder, ":\n");
+    append(builder, status);
+    if status[status.count - 1] != #char "\n" append(builder, #char "\n");
+}
+
+generator_generation_input_status :: (root: string) -> string {
+    builder: String_Builder;
+
+    root_status := generator_repository_input_status(root);
+    defer port_owned_string_drop(*root_status);
+    generator_append_status_section(*builder, "generator repository", root_status);
+
+    for relative_path: GENERATOR_INPUT_SUBMODULES {
+        repository := tprint("%/%", root, relative_path);
+        status := generator_run_capture(
+            string.[
+                "git", "-C", repository, "status", "--porcelain",
+                "--untracked-files=all",
+            ],
+            root,
+            tprint("inspect %", relative_path),
+        );
+        defer port_owned_string_drop(*status);
+        generator_append_status_section(*builder, relative_path, status);
+    }
+
+    return builder_to_string(*builder);
 }
 
 generator_read_provenance :: (root: string) -> Generator_Provenance {
@@ -389,13 +435,10 @@ generator_transpile :: (
     if port.language != .CPP generator_error("the first generator slice supports C++ ports only");
 
     transpiler_directory := tprint("%/src/tbx/transpiler", root);
-    regex_library := tprint(
-        "%/host_libraries/c_transpiler_regex_compat.so", transpiler_directory,
-    );
     cpp_exporter := tprint(
         "%/host_libraries/libclangCppAstExporter.so", transpiler_directory,
     );
-    if !compat_path_exists(regex_library) || !compat_path_exists(cpp_exporter)
+    if !compat_path_exists(cpp_exporter)
         generator_error("transpiler host libraries are missing; run ./scripts/bootstrap.sh");
 
     previous_directory := get_working_directory();
@@ -553,7 +596,7 @@ generator_verify_package :: (
     if !module_parent.has_value
         generator_error(tprint("module package has no parent directory: %", package_directory));
     generator_run_checked(
-        string.["jai", verification_source, "-quiet", "-output_path",
+        string.[GENERATOR_JAI_EXECUTABLE, verification_source, "-quiet", "-output_path",
                 verification_directory, "-exe", verification_name,
                 "-import_dir", module_parent.value],
         root,
@@ -953,9 +996,13 @@ generator_generate :: (port_name: string, options: Generator_Options) {
     defer deinit(*provenance);
     package_directory := generator_build_package(root, *port, options, *provenance);
     generator_sync_package(root, *port, package_directory);
-    if provenance.dirty print(
-        "Generated development metadata: generator inputs are dirty and cannot be published.\n",
-    );
+    if provenance.dirty {
+        print("Generated development metadata cannot be published.\n");
+        if !provenance.has_commit print("generator repository has no commit.\n");
+        status := generator_generation_input_status(root);
+        defer port_owned_string_drop(*status);
+        if status.count print("Dirty generator inputs:\n%", status);
+    }
 }
 
 generator_check :: (port_name: string, options: Generator_Options) {

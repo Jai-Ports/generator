@@ -5,13 +5,11 @@ Jai Ports generator
 Usage:
   generator list
   generator <port> [--offline]
-  generator generate <port> [--offline]
   generator check <port> [--offline]
   generator publish <port> [--offline]
 
 Commands:
   list       List available typed port recipes.
-  generate   Build, verify, and synchronize development output.
   check      Build and verify, then fail if the output repository differs.
   publish    Require clean pushed inputs, verify, and commit generated output.
 
@@ -40,7 +38,7 @@ generator_cli_main :: () {
     }
     port_name: string;
     option_start: int;
-    if command == "generate" || command == "check" || command == "publish" {
+    if command == "check" || command == "publish" {
         if command_line.count < 3 generator_error(tprint("% requires a port name", command));
         port_name = command_line[2];
         option_start = 3;
@@ -48,7 +46,7 @@ generator_cli_main :: () {
         port, found := generator_find_port(command);
         if !found generator_error(tprint("unknown command or port: %", command));
         port_name = port.name;
-        command = "generate";
+        command = "port";
         option_start = 2;
     }
 
@@ -59,7 +57,7 @@ generator_cli_main :: () {
         else generator_error(tprint("unknown option: %", argument));
     }
 
-    if command == "generate" generator_generate(port_name, options);
+    if command == "port" generator_generate(port_name, options);
     else if command == "check" generator_check(port_name, options);
     else generator_publish(port_name, options);
 }
