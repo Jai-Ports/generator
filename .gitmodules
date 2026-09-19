@@ -1,0 +1,9 @@
+[submodule "src/tbx/transpiler"]
+	path = src/tbx/transpiler
+	url = git@github.com:jai-toolbox/transpiler.git
+[submodule "src/tbx/arena"]
+	path = src/tbx/arena
+	url = git@github.com:jai-toolbox/arena.git
+[submodule "src/tbx/json"]
+	path = src/tbx/json
+	url = git@github.com:jai-toolbox/json.git
