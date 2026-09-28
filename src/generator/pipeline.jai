@@ -47,8 +47,9 @@ generator_run_checked :: (
     arguments: [] string,
     working_directory: string,
     stage: string,
+    environment_overrides: [] Translator_Process_Environment_Override = .[],
 ) {
-    result := translator_process_run_output(arguments, working_directory);
+    result := translator_process_run_output(arguments, working_directory, environment_overrides);
     defer translator_process_output_result_deinit(*result);
     if generator_process_succeeded(*result) return;
 
@@ -97,98 +98,6 @@ generator_trim_line_endings :: (value: string) -> string {
     return result;
 }
 
-generator_string_ends_with :: (value: string, suffix: string) -> bool {
-    if suffix.count > value.count return false;
-    offset := value.count - suffix.count;
-    for byte, index: suffix if value[offset + index] != byte return false;
-    return true;
-}
-
-generator_string_starts_with :: (value: string, prefix: string) -> bool {
-    if prefix.count > value.count return false;
-    for byte, index: prefix if value[index] != byte return false;
-    return true;
-}
-
-generator_identifier_start :: (byte: u8) -> bool {
-    return byte == #char "_" ||
-           (byte >= #char "a" && byte <= #char "z") ||
-           (byte >= #char "A" && byte <= #char "Z");
-}
-
-generator_identifier_continue :: (byte: u8) -> bool {
-    return generator_identifier_start(byte) ||
-           (byte >= #char "0" && byte <= #char "9");
-}
-
-Generator_Internal_Name :: struct {
-    original: string;
-    canonical: string;
-}
-
-generator_internal_name_has_numeric_suffix :: (identifier: string) -> bool {
-    if !generator_string_starts_with(identifier, "cpp_transpiler_") &&
-       !generator_string_starts_with(identifier, "temporary_") return false;
-    separator := identifier.count - 1;
-    while separator >= 0 && identifier[separator] >= #char "0" &&
-          identifier[separator] <= #char "9" separator -= 1;
-    return separator >= 0 && separator + 1 < identifier.count &&
-           identifier[separator] == #char "_";
-}
-
-// Clang protocol IDs are stable inside one AST, but a few synthesized IDs can
-// be allocated in either order across otherwise identical exporter runs. They
-// only appear in private generated temporary names. Canonicalize those names
-// by first appearance so output repositories remain byte-for-byte reproducible.
-generator_canonicalize_internal_names :: (source: string) -> string {
-    names: [..] Generator_Internal_Name;
-    defer {
-        for *name: names {
-            port_owned_string_drop(*name.original);
-            port_owned_string_drop(*name.canonical);
-        }
-        array_free(names);
-    }
-
-    output: String_Builder;
-    cursor := 0;
-    while cursor < source.count {
-        if !generator_identifier_start(source[cursor]) {
-            append(*output, source[cursor]);
-            cursor += 1;
-            continue;
-        }
-        end := cursor + 1;
-        while end < source.count && generator_identifier_continue(source[end]) end += 1;
-        identifier := compat_string_slice(source, cursor, end);
-        if !generator_internal_name_has_numeric_suffix(identifier) {
-            append(*output, identifier);
-            cursor = end;
-            continue;
-        }
-
-        replacement := "";
-        for *name: names if name.original == identifier {
-            replacement = name.canonical;
-            break;
-        }
-        if !replacement.count {
-            separator := identifier.count - 1;
-            while identifier[separator] >= #char "0" &&
-                  identifier[separator] <= #char "9" separator -= 1;
-            base := compat_string_slice(identifier, 0, separator + 1);
-            replacement = copy_string(tprint("%g%", base, names.count));
-            array_add(*names, .{
-                original = copy_string(identifier),
-                canonical = replacement,
-            });
-        }
-        append(*output, replacement);
-        cursor = end;
-    }
-    return builder_to_string(*output);
-}
-
 generator_repository_root :: () -> string {
     candidate := tprint("%/../..", GENERATOR_SOURCE_DIRECTORY);
     root, ok := File.get_absolute_path(candidate);
@@ -201,7 +110,7 @@ generator_repository_input_status :: (root: string) -> string {
         string.[
             "git", "-C", root, "status", "--porcelain",
             "--untracked-files=all", "--",
-            ".gitmodules", "build.jai", "src", "ports", "tests",
+            ".gitmodules", "build.jai", "src", "ports",
         ],
         root,
         "inspect generator inputs",
@@ -302,13 +211,14 @@ generator_json_append_array :: (builder: *String_Builder, values: [] string, ind
 }
 
 generator_find_port :: (name: string) -> (Port_Spec, bool) {
-    if name == "xatlas" return xatlas_port(), true;
+    for port: generator_registered_ports() if port.name == name return port, true;
     return .{}, false;
 }
 
 generator_list_ports :: () {
-    port := xatlas_port();
-    print("%\t%\t%\n", port.name, port.upstream_commit, port.description);
+    ports := generator_registered_ports();
+    for *port: ports
+        print("%\t%\n", port.name, port.upstream_commit);
 }
 
 generator_prepare_upstream :: (
@@ -386,27 +296,136 @@ generator_prepare_upstream :: (
     return checkout;
 }
 
+generator_prepare_submodules :: (
+    root: string, source_root: string,
+    submodules: [] Port_Submodule_Spec, offline: bool,
+) {
+    for entry, index: submodules {
+        generator_require_managed_relative_path(entry.path, "submodule path");
+        generator_require_managed_relative_path(entry.license_file, "submodule license");
+        if !entry.name.count generator_error("submodule name is empty");
+        for other, other_index: submodules {
+            if other_index >= index break;
+            if other.path == entry.path || other.name == entry.name
+                generator_error("duplicate submodule name or path");
+        }
+        link := generator_run_capture(
+            string.["git", "-C", source_root, "ls-tree", "HEAD", "--", entry.path],
+            root, "verify pinned submodule gitlink",
+        );
+        defer port_owned_string_drop(*link);
+        expected := tprint("160000 commit %\t%", entry.upstream_commit, entry.path);
+        if generator_trim_line_endings(link) != expected
+            generator_error(tprint("submodule % does not match its pinned gitlink", entry.path));
+        for field: string.["path", "url"] {
+            value := generator_run_capture(
+                string.["git", "-C", source_root, "config", "--file", ".gitmodules",
+                        "--get", tprint("submodule.%.%", entry.name, field)],
+                root, "verify pinned submodule configuration",
+            );
+            defer port_owned_string_drop(*value);
+            wanted := ifx field == "path" then entry.path else entry.upstream_url;
+            if generator_trim_line_endings(value) != wanted
+                generator_error(tprint("submodule % % does not match its recipe", entry.name, field));
+        }
+        checkout := tprint("%/%", source_root, entry.path);
+        if !compat_path_exists(tprint("%/.git", checkout)) {
+            if offline generator_error(tprint("pinned submodule is missing: %; rerun without --offline", entry.path));
+            // Explicit checkout ignores custom update strategies. Git uses the
+            // pinned gitlink; no branch or unpinned HEAD is requested.
+            generator_run_checked(
+                string.["git", "-c", tprint("submodule.%.url=%", entry.name, entry.upstream_url),
+                        "-C", source_root, "submodule", "update", "--init",
+                        "--checkout", "--", entry.path], root,
+                tprint("prepare pinned submodule %", entry.path),
+            );
+        }
+        revision := generator_run_capture(
+            string.["git", "-C", checkout, "rev-parse", "HEAD"], root,
+            "verify submodule revision",
+        );
+        defer port_owned_string_drop(*revision);
+        if generator_trim_line_endings(revision) != entry.upstream_commit
+            generator_error(tprint("submodule % has the wrong revision", entry.path));
+        status := generator_run_capture(
+            string.["git", "-C", checkout, "status", "--porcelain", "--untracked-files=all"],
+            root, "verify clean submodule checkout",
+        );
+        defer port_owned_string_drop(*status);
+        if status.count generator_error(tprint("managed submodule checkout is dirty: %\n%", checkout, status));
+    }
+}
+
+generator_resolve_source_path :: (
+    source_root: string, port: *Port_Spec, relative_path: string,
+) -> string {
+    if relative_path.count && relative_path[0] == #char "@" {
+        separator := 1;
+        while separator < relative_path.count && relative_path[separator] != #char "/"
+            separator += 1;
+        name := compat_string_slice(relative_path, 1, separator);
+        for dependency: port.dependencies if dependency.name == name {
+            parent := compat_path_parent(source_root);
+            assert(parent.has_value);
+            if separator == relative_path.count return tprint("%/%", parent.value, name);
+            path := compat_string_slice(relative_path, separator + 1, relative_path.count);
+            generator_require_managed_relative_path(path, "dependency source path");
+            return tprint("%/%/%", parent.value, name, path);
+        }
+        generator_error(tprint("% references undeclared dependency: %", port.name, name));
+    }
+    generator_require_managed_relative_path(relative_path, "source/include path");
+    return tprint("%/%", source_root, relative_path);
+}
+
 generator_write_compile_database :: (
     path: string,
     source_root: string,
     port: *Port_Spec,
+    module: *Port_Module_Spec,
+    prepared_include_directory: string = "",
 ) {
     builder: String_Builder;
     append(*builder, "[\n");
-    for source_file, source_index: port.source_files {
-        generator_require_managed_relative_path(source_file, "source file");
-        source_path := tprint("%/%", source_root, source_file);
+    source_paths: [..] string;
+    defer array_free(source_paths);
+    source_groups: [..] *Port_Source_Group_Spec;
+    defer array_free(source_groups);
+    for source_file: module.source_files {
+        array_add(*source_paths, generator_resolve_source_path(source_root, port, source_file));
+        array_add(*source_groups, null);
+    }
+    for source_file: module.generator_source_files {
+        generator_require_managed_relative_path(source_file, "generator source file");
+        array_add(*source_paths, tprint("%/%", generator_repository_root(), source_file));
+        array_add(*source_groups, null);
+    }
+    for *group: module.source_groups for source_file: group.source_files {
+        array_add(*source_paths, generator_resolve_source_path(source_root, port, source_file));
+        array_add(*source_groups, group);
+    }
+    for source_path, source_index: source_paths {
         if !compat_path_exists(source_path)
             generator_error(tprint("configured source file does not exist: %", source_path));
 
         arguments: [..] string;
-        array_add(*arguments, "clang++");
+        array_add(*arguments, ifx port.language == .C then "clang" else "clang++");
         array_add(*arguments, tprint("-std=%", port.standard));
+        if prepared_include_directory.count
+            array_add(*arguments, tprint("-I%", prepared_include_directory));
         for flag: port.compiler_flags array_add(*arguments, flag);
-        for define: port.defines array_add(*arguments, tprint("-D%", define));
+        for flag: module.compiler_flags array_add(*arguments, flag);
+        for define: module.defines array_add(*arguments, tprint("-D%", define));
+        group := source_groups[source_index];
+        if group {
+            for flag: group.compiler_flags array_add(*arguments, flag);
+            for define: group.defines array_add(*arguments, tprint("-D%", define));
+            for include_directory: group.include_directories
+                array_add(*arguments, tprint("-I%", generator_resolve_source_path(source_root, port, include_directory)));
+        }
         for include_directory: port.include_directories {
-            generator_require_managed_relative_path(include_directory, "include directory");
-            array_add(*arguments, tprint("-I%/%", source_root, include_directory));
+            include_path := generator_resolve_source_path(source_root, port, include_directory);
+            array_add(*arguments, tprint("-I%", include_path));
         }
         array_add(*arguments, "-c");
         array_add(*arguments, source_path);
@@ -418,7 +437,7 @@ generator_write_compile_database :: (
         append(*builder, ",\n    \"arguments\": ");
         generator_json_append_array(*builder, arguments, "      ");
         append(*builder, "\n  }");
-        if source_index + 1 < port.source_files.count append(*builder, #char ",");
+        if source_index + 1 < source_paths.count append(*builder, #char ",");
         append(*builder, #char "\n");
         array_free(arguments);
     }
@@ -426,14 +445,107 @@ generator_write_compile_database :: (
     assert(File.write_entire_file(path, *builder));
 }
 
+generator_prepare_cmake :: (
+    root: string, source_root: string, work_directory: string, preparation: *Port_CMake_Spec,
+    link_targets: [] string = string.[],
+    port: *Port_Spec = null,
+) -> string {
+    directory := tprint("%/cmake", work_directory);
+    configured_source := source_root;
+    if preparation.source_directory.count {
+        generator_require_managed_relative_path(preparation.source_directory, "CMake source directory");
+        configured_source = tprint("%/%", source_root, preparation.source_directory);
+    }
+    generator_prepare_cmake_system_links(directory, link_targets);
+    arguments: [..] string;
+    defer array_free(arguments);
+    array_add(*arguments, "cmake", "-S", configured_source, "-B", directory, "-G", "Ninja",
+        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON", "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_C_COMPILER=clang", "-DCMAKE_CXX_COMPILER=clang++");
+    array_add(*arguments, tprint("-DCMAKE_PROJECT_INCLUDE=%/generator_system_links.cmake", directory));
+    for variable: preparation.cache_variables {
+        separator := compat_string_find(variable, "=");
+        if separator <= 0 generator_error(tprint("CMake cache variable must use KEY=VALUE: %", variable));
+        key := compat_string_slice(variable, 0, separator);
+        if key == "CMAKE_EXPORT_COMPILE_COMMANDS" || key == "CMAKE_C_COMPILER" ||
+           key == "CMAKE_CXX_COMPILER" || key == "CMAKE_GENERATOR" || key == "CMAKE_PROJECT_INCLUDE"
+            generator_error(tprint("CMake preparation reserves cache variable %", key));
+        for byte: key if !((byte >= #char "A" && byte <= #char "Z") ||
+                          (byte >= #char "a" && byte <= #char "z") ||
+                          (byte >= #char "0" && byte <= #char "9") || byte == #char "_")
+            generator_error(tprint("invalid CMake cache variable key: %", key));
+        array_add(*arguments, tprint("-D%", variable));
+    }
+    for variable: preparation.source_cache_variables {
+        if port == null generator_error("CMake source cache mappings require a port specification");
+        if !variable.key.count generator_error("CMake source cache key cannot be empty");
+        for byte: variable.key if !((byte >= #char "A" && byte <= #char "Z") ||
+                                   (byte >= #char "a" && byte <= #char "z") ||
+                                   (byte >= #char "0" && byte <= #char "9") || byte == #char "_")
+            generator_error(tprint("invalid CMake source cache variable key: %", variable.key));
+        if variable.key == "CMAKE_EXPORT_COMPILE_COMMANDS" || variable.key == "CMAKE_C_COMPILER" ||
+           variable.key == "CMAKE_CXX_COMPILER" || variable.key == "CMAKE_GENERATOR" ||
+           variable.key == "CMAKE_PROJECT_INCLUDE"
+            generator_error(tprint("CMake preparation reserves cache variable %", variable.key));
+        source := generator_resolve_source_path(source_root, port, variable.source);
+        if !compat_path_exists(source) generator_error(tprint("CMake source cache path does not exist: %", source));
+        array_add(*arguments, tprint("-D%=%", variable.key, source));
+    }
+    generator_run_checked(arguments, root, "configure pinned upstream source");
+    if preparation.build_targets.count {
+        arguments.count = 0;
+        array_add(*arguments, "cmake", "--build", directory, "--parallel", "1", "--target");
+        for target: preparation.build_targets {
+            generator_require_managed_relative_path(target, "CMake preparation target");
+            if target == "all" || target == "install" || target == "clean"
+                generator_error(tprint("CMake preparation requires an explicit generated target: %", target));
+            array_add(*arguments, target);
+        }
+        generator_run_checked(arguments, root, "generate upstream build headers");
+    }
+    return directory;
+}
+
+generator_write_cmake_compile_database :: (
+    path: string, cmake_directory: string, targets: [] string,
+) {
+    generator_write_cmake_compile_database_native(
+        path, tprint("%/compile_commands.json", cmake_directory), targets,
+    );
+}
+
+generator_prepare_make :: (root: string, source_root: string, work_directory: string, port: *Port_Spec) -> string {
+    preparation := *port.make;
+    directory := tprint("%/make", work_directory);
+    script := generator_resolve_source_path(source_root, port, preparation.configure_script);
+    for target: preparation.generated_targets {
+        generator_require_managed_relative_path(target, "Make generated target");
+    }
+    generator_prepare_make_native(
+        directory, script, preparation.configure_arguments,
+        preparation.variables, preparation.generated_targets,
+    );
+    return directory;
+}
+
+generator_write_make_compile_database :: (root: string, path: string, directory: string, port: *Port_Spec, module: *Port_Module_Spec) {
+    for target: module.make_targets {
+        generator_require_managed_relative_path(target, "Make source target");
+    }
+    generator_write_make_compile_database_native(
+        path, directory, port.make.variables, module.make_targets,
+    );
+}
+
 generator_transpile :: (
     root: string,
     port: *Port_Spec,
+    module: *Port_Module_Spec,
     compile_database: string,
     output_directory: string,
+    prepared_include_directory: string = "",
+    system_libraries_manifest: string = "",
 ) {
-    if port.language != .CPP generator_error("the first generator slice supports C++ ports only");
-
     transpiler_directory := tprint("%/src/tbx/transpiler", root);
     cpp_exporter := tprint(
         "%/host_libraries/libclangCppAstExporter.so", transpiler_directory,
@@ -454,15 +566,27 @@ generator_transpile :: (
     config.overwrite_existing = true;
     config.emission_profile = .OPTIMIZED;
     config.procedure_abi = .JAI;
-    config.module_name = port_optional_some(copy_string(port.name));
+    config.module_name = port_optional_some(copy_string(module.transpiler_prefix));
     config.output_directory = port_optional_some(copy_string(output_directory));
-    cpp_transpiler_run(config, compile_database, .[]);
+    if system_libraries_manifest.count
+        config.system_libraries_manifest = port_optional_some(copy_string(system_libraries_manifest));
+    additional_flags: [..] string;
+    defer array_free(additional_flags);
+    if module.cmake_targets.count {
+        if prepared_include_directory.count
+            array_add(*additional_flags, tprint("-I%", prepared_include_directory));
+        for flag: port.compiler_flags array_add(*additional_flags, flag);
+        for flag: module.compiler_flags array_add(*additional_flags, flag);
+        for define: module.defines array_add(*additional_flags, tprint("-D%", define));
+    }
+    cpp_transpiler_run(config, compile_database, additional_flags);
 }
 
 Generator_Copy_Arguments :: struct {
     destination: string;
     source_root: string;
     upstream_label: string;
+    dependencies: [] Port_Dependency_Spec;
     copied_count: int;
 }
 
@@ -471,11 +595,13 @@ generator_copy_transpiled_output :: (
     generated_destination: string,
     source_root: string,
     upstream_label: string,
+    dependencies: [] Port_Dependency_Spec,
 ) {
     args := Generator_Copy_Arguments.{
         destination = generated_destination,
         source_root = source_root,
         upstream_label = upstream_label,
+        dependencies = dependencies,
     };
     visitor :: (info: *File_Utilities.File_Visit_Info, args: *Generator_Copy_Arguments) {
         if info.is_directory || !generator_string_ends_with(info.short_name, ".jai") return;
@@ -484,6 +610,15 @@ generator_copy_transpiled_output :: (
         defer free(contents.data);
         path_normalized := cpp_jai_replace_all(contents, args.source_root, args.upstream_label);
         defer port_owned_string_drop(*path_normalized);
+        parent := compat_path_parent(args.source_root);
+        assert(parent.has_value);
+        for dependency: args.dependencies {
+            replaced := cpp_jai_replace_all(
+                path_normalized, tprint("%/%", parent.value, dependency.name), dependency.upstream_label,
+            );
+            port_owned_string_drop(*path_normalized);
+            path_normalized = replaced;
+        }
         normalized := generator_canonicalize_internal_names(path_normalized);
         defer port_owned_string_drop(*normalized);
         destination := tprint("%/%", args.destination, info.short_name);
@@ -504,10 +639,8 @@ generator_write_port_metadata :: (
     provenance: *Generator_Provenance,
 ) {
     builder: String_Builder;
-    append(*builder, "{\n  \"schema_version\": 2,\n  \"name\": ");
+    append(*builder, "{\n  \"schema_version\": 3,\n  \"name\": ");
     generator_json_append_string(*builder, port.name);
-    append(*builder, ",\n  \"description\": ");
-    generator_json_append_string(*builder, port.description);
     append(*builder, ",\n  \"upstream\": {\n    \"url\": ");
     generator_json_append_string(*builder, port.upstream_url);
     append(*builder, ",\n    \"commit\": ");
@@ -519,94 +652,267 @@ generator_write_port_metadata :: (
         generator_json_append_string(*builder, provenance.commit);
     else append(*builder, "null");
     append(*builder, "\n  }");
-    append(*builder, ",\n  \"language\": \"c++\",\n  \"standard\": ");
+    append(*builder, ",\n  \"language\": ");
+    generator_json_append_string(
+        *builder, ifx port.language == .C then "c" else "c++",
+    );
+    append(*builder, ",\n  \"standard\": ");
     generator_json_append_string(*builder, port.standard);
     append(*builder, ",\n  \"supported_target\": ");
     generator_json_append_string(*builder, port.supported_target);
-    append(*builder, ",\n  \"sources\": ");
-    generator_json_append_array(*builder, port.source_files, "    ");
     append(*builder, ",\n  \"include_directories\": ");
     generator_json_append_array(*builder, port.include_directories, "    ");
-    append(*builder, ",\n  \"defines\": ");
-    generator_json_append_array(*builder, port.defines, "    ");
     append(*builder, ",\n  \"compiler_flags\": ");
     generator_json_append_array(*builder, port.compiler_flags, "    ");
+    append(*builder, ",\n  \"cmake\": {\"enabled\": ");
+    append(*builder, ifx port.cmake.enabled then "true" else "false");
+    append(*builder, ", \"source_directory\": ");
+    generator_json_append_string(*builder, port.cmake.source_directory);
+    append(*builder, ", \"cache_variables\": ");
+    generator_json_append_array(*builder, port.cmake.cache_variables, "      ");
+    append(*builder, ", \"source_cache_variables\": [");
+    for variable, index: port.cmake.source_cache_variables {
+        if index append(*builder, ",");
+        append(*builder, "{\"key\": ");
+        generator_json_append_string(*builder, variable.key);
+        append(*builder, ", \"source\": ");
+        generator_json_append_string(*builder, variable.source);
+        append(*builder, "}");
+    }
+    append(*builder, "]");
+    append(*builder, ", \"build_targets\": ");
+    generator_json_append_array(*builder, port.cmake.build_targets, "      ");
+    append(*builder, "}");
+    append(*builder, ",\n  \"make\": {\"enabled\": ");
+    append(*builder, ifx port.make.enabled then "true" else "false");
+    append(*builder, ", \"configure_script\": ");
+    generator_json_append_string(*builder, port.make.configure_script);
+    append(*builder, ", \"configure_arguments\": ");
+    generator_json_append_array(*builder, port.make.configure_arguments, "      ");
+    append(*builder, ", \"variables\": ");
+    generator_json_append_array(*builder, port.make.variables, "      ");
+    append(*builder, ", \"generated_targets\": ");
+    generator_json_append_array(*builder, port.make.generated_targets, "      ");
+    append(*builder, "}");
+    append(*builder, ",\n  \"prepared_files\": [");
+    for prepared, index: port.prepared_files {
+        if index append(*builder, ",");
+        append(*builder, "\n    {\"source\": ");
+        generator_json_append_string(*builder, prepared.source);
+        append(*builder, ", \"destination\": ");
+        generator_json_append_string(*builder, prepared.destination);
+        append(*builder, "}");
+    }
+    append(*builder, "\n  ]");
+    append(*builder, ",\n  \"dependencies\": [");
+    for dependency, index: port.dependencies {
+        if index append(*builder, ",");
+        append(*builder, "\n    {\"name\": ");
+        generator_json_append_string(*builder, dependency.name);
+        append(*builder, ", \"url\": ");
+        generator_json_append_string(*builder, dependency.upstream_url);
+        append(*builder, ", \"commit\": ");
+        generator_json_append_string(*builder, dependency.upstream_commit);
+        append(*builder, "}");
+    }
+    append(*builder, "\n  ]");
+    append(*builder, ",\n  \"submodules\": [");
+    for entry, index: port.submodules {
+        if index append(*builder, ",");
+        append(*builder, "\n    {\"path\": ");
+        generator_json_append_string(*builder, entry.path);
+        append(*builder, ", \"url\": ");
+        generator_json_append_string(*builder, entry.upstream_url);
+        append(*builder, ", \"commit\": ");
+        generator_json_append_string(*builder, entry.upstream_commit);
+        append(*builder, "}");
+    }
+    append(*builder, "\n  ]");
+    append(*builder, ",\n  \"modules\": [\n");
+    for *module, module_index: port.modules {
+        append(*builder, "    {\n      \"path\": ");
+        generator_json_append_string(*builder, module.output_path);
+        append(*builder, ",\n      \"transpiler_prefix\": ");
+        generator_json_append_string(*builder, module.transpiler_prefix);
+        append(*builder, ",\n      \"sources\": ");
+        generator_json_append_array(*builder, module.source_files, "        ");
+        append(*builder, ",\n      \"generator_sources\": [");
+        for source_file, source_index: module.generator_source_files {
+            generator_require_managed_relative_path(source_file, "generator source file");
+            root := generator_repository_root();
+            digest := generator_run_capture(string.["sha256sum", "--", tprint("%/%", root, source_file)],
+                root, "hash concrete generator source");
+            defer port_owned_string_drop(*digest);
+            if digest.count < 64 generator_error("invalid source SHA256 result");
+            if source_index append(*builder, ",");
+            append(*builder, "{\"path\": ");
+            generator_json_append_string(*builder, source_file);
+            append(*builder, ", \"sha256\": ");
+            generator_json_append_string(*builder, compat_string_slice(digest, 0, 64));
+            append(*builder, "}");
+        }
+        append(*builder, "]");
+        append(*builder, ",\n      \"source_groups\": [");
+        for group, group_index: module.source_groups {
+            if group_index append(*builder, ",");
+            append(*builder, "{\"sources\": ");
+            generator_json_append_array(*builder, group.source_files, "        ");
+            append(*builder, ", \"include_directories\": ");
+            generator_json_append_array(*builder, group.include_directories, "        ");
+            append(*builder, ", \"defines\": ");
+            generator_json_append_array(*builder, group.defines, "        ");
+            append(*builder, ", \"compiler_flags\": ");
+            generator_json_append_array(*builder, group.compiler_flags, "        ");
+            append(*builder, "}");
+        }
+        append(*builder, "]");
+        append(*builder, ",\n      \"cmake_targets\": ");
+        generator_json_append_array(*builder, module.cmake_targets, "        ");
+        append(*builder, ",\n      \"make_targets\": ");
+        generator_json_append_array(*builder, module.make_targets, "        ");
+        append(*builder, ",\n      \"defines\": ");
+        generator_json_append_array(*builder, module.defines, "        ");
+        append(*builder, ",\n      \"compiler_flags\": ");
+        generator_json_append_array(*builder, module.compiler_flags, "        ");
+        append(*builder, ",\n      \"system_libraries\": ");
+        generator_json_append_array(*builder, module.system_libraries, "        ");
+        append(*builder, ",\n      \"entry\": ");
+        generator_json_append_string(*builder, module.generated_entry);
+        append(*builder, "\n    }");
+        if module_index + 1 < port.modules.count append(*builder, #char ",");
+        append(*builder, #char "\n");
+    }
+    append(*builder, "  ]");
     append(*builder, "\n}\n");
     assert(File.write_entire_file(path, *builder));
 }
 
-generator_assemble_package :: (
-    root: string,
+generator_assemble_module :: (
     port: *Port_Spec,
+    module: *Port_Module_Spec,
     source_root: string,
     transpiled_directory: string,
-    package_directory: string,
-    provenance: *Generator_Provenance,
+    module_directory: string,
 ) {
-    package_source_directory := tprint("%/src", package_directory);
-    assert(File.make_directory_if_it_does_not_exist(package_source_directory, recursive = true));
+    module_source_directory := tprint("%/src", module_directory);
+    assert(File.make_directory_if_it_does_not_exist(module_source_directory, recursive = true));
 
     transpiled_source_directory := tprint("%/src", transpiled_directory);
     generator_copy_transpiled_output(
-        transpiled_source_directory, package_source_directory, source_root,
-        port.upstream_label,
+        transpiled_source_directory, module_source_directory, source_root,
+        port.upstream_label, port.dependencies,
     );
-    if !compat_path_exists(tprint("%/%", package_source_directory, port.generated_entry))
-        generator_error(tprint("configured generated entry was not emitted: %", port.generated_entry));
+    if !compat_path_exists(tprint("%/%", module_source_directory, module.generated_entry))
+        generator_error(tprint(
+            "configured generated entry was not emitted for %: %",
+            module.transpiler_prefix, module.generated_entry,
+        ));
 
     module_source := tprint(
         "// Generated package entry point.\n#load \"src/%\";\n",
-        port.generated_entry,
+        module.generated_entry,
     );
-    assert(File.write_entire_file(tprint("%/module.jai", package_directory), module_source));
+    assert(File.write_entire_file(tprint("%/module.jai", module_directory), module_source));
+}
+
+generator_assemble_package_files :: (
+    port: *Port_Spec,
+    source_root: string,
+    package_directory: string,
+    provenance: *Generator_Provenance,
+) {
+    assert(File.make_directory_if_it_does_not_exist(package_directory, recursive = true));
 
     license_source := tprint("%/%", source_root, port.license_file);
     license_contents, license_ok := File.read_entire_file(license_source);
     if !license_ok generator_error(tprint("could not read upstream license: %", license_source));
     defer free(license_contents.data);
     assert(File.write_entire_file(tprint("%/LICENSE", package_directory), license_contents));
+    parent := compat_path_parent(source_root);
+    assert(parent.has_value);
+    for dependency: port.dependencies {
+        path := tprint("%/%/%", parent.value, dependency.name, dependency.license_file);
+        contents, ok := File.read_entire_file(path);
+        if !ok generator_error(tprint("could not read dependency license: %", path));
+        defer free(contents.data);
+        assert(File.write_entire_file(tprint("%/LICENSE-%", package_directory, dependency.name), contents));
+    }
+    for entry, index: port.submodules {
+        path := tprint("%/%/%", source_root, entry.path, entry.license_file);
+        contents, ok := File.read_entire_file(path);
+        if !ok generator_error(tprint("could not read submodule license: %", path));
+        defer free(contents.data);
+        assert(File.write_entire_file(tprint("%/LICENSE-submodule-%", package_directory, index), contents));
+    }
 
     generator_write_port_metadata(
         tprint("%/PORT.json", package_directory), port, provenance,
     );
 }
 
-generator_verify_package :: (
+generator_test_module :: (
     root: string,
     port: *Port_Spec,
+    module: *Port_Module_Spec,
     package_directory: string,
-    verification_directory: string,
+    test_directory: string,
 ) {
-    assert(File.make_directory_if_it_does_not_exist(verification_directory, recursive = true));
-    verification_name := tprint("%_module_verification", port.name);
-    configured_verification_source := tprint("%/%", root, port.verification_file);
-    verification_contents, verification_ok := File.read_entire_file(
-        configured_verification_source,
+    assert(File.make_directory_if_it_does_not_exist(test_directory, recursive = true));
+    test_name := tprint(
+        "%_%_module_test", port.name, module.transpiler_prefix,
     );
-    if !verification_ok generator_error(tprint(
-        "could not read module verification: %", configured_verification_source,
+    configured_test_source := ifx module.output_path.count
+        then tprint("%/ports/%/%/test.jai", root, port.name, module.output_path)
+        else tprint("%/ports/%/test.jai", root, port.name);
+    test_contents, test_ok := File.read_entire_file(
+        configured_test_source,
+    );
+    if !test_ok generator_error(tprint(
+        "could not read module test: %", configured_test_source,
     ));
-    defer free(verification_contents.data);
-    verification_source := tprint(
-        "%/%_verification.jai", verification_directory, port.name,
+    defer free(test_contents.data);
+    test_source := tprint(
+        "%/%_%_test.jai",
+        test_directory, port.name, module.transpiler_prefix,
     );
-    assert(File.write_entire_file(verification_source, verification_contents));
-    verification_binary := tprint("%/%", verification_directory, verification_name);
+    assert(File.write_entire_file(test_source, test_contents));
+    test_binary := tprint("%/%", test_directory, test_name);
     module_parent := compat_path_parent(package_directory);
     if !module_parent.has_value
         generator_error(tprint("module package has no parent directory: %", package_directory));
+    module_directory := ifx module.output_path.count
+        then tprint("%/%", package_directory, module.output_path) else package_directory;
+    library_manifest := tprint("%/SYSTEM_LIBRARIES.json", module_directory);
+    test_environment := generator_test_environment(library_manifest);
+    defer generator_test_environment_deinit(*test_environment);
+    launch: [..] string;
+    defer array_free(launch);
+    array_add(*launch, GENERATOR_JAI_EXECUTABLE, test_source, "-quiet", "-output_path",
+        test_directory, "-exe", test_name, "-import_dir", module_parent.value);
     generator_run_checked(
-        string.[GENERATOR_JAI_EXECUTABLE, verification_source, "-quiet", "-output_path",
-                verification_directory, "-exe", verification_name,
-                "-import_dir", module_parent.value],
+        launch,
         root,
-        tprint("compile % module verification", port.name),
+        tprint("compile %/% module test", port.name, module.transpiler_prefix),
+        test_environment,
     );
+    launch.count = 0;
+    array_add(*launch, test_binary);
     generator_run_checked(
-        string.[verification_binary], verification_directory,
-        tprint("run % module verification", port.name),
+        launch, test_directory,
+        tprint("run %/% module test", port.name, module.transpiler_prefix),
+        test_environment,
     );
-    print("Verified % module.\n", port.name);
+    if module.output_path.count
+        print("Tested %/% module.\n", port.name, module.output_path);
+    else print("Tested % module.\n", port.name);
+}
+
+generator_output_repository_relative :: (port: *Port_Spec) -> string {
+    return tprint("out/%", port.name);
+}
+
+generator_output_repository_path :: (root: string, port: *Port_Spec) -> string {
+    return tprint("%/out/%", root, port.name);
 }
 
 generator_prepare_output_repository :: (
@@ -614,7 +920,7 @@ generator_prepare_output_repository :: (
     port: *Port_Spec,
     offline: bool,
 ) -> string {
-    output_repository := tprint("%/%", root, port.output_repository);
+    output_repository := generator_output_repository_path(root, port);
     if compat_path_exists(tprint("%/.git", output_repository))
         return output_repository;
     if compat_path_exists(output_repository)
@@ -666,7 +972,7 @@ generator_sync_package :: (
     port: *Port_Spec,
     package_directory: string,
 ) {
-    output_repository := tprint("%/%", root, port.output_repository);
+    output_repository := generator_output_repository_path(root, port);
     if !compat_path_exists(tprint("%/.git", output_repository))
         generator_error(tprint("output repository is not initialized: %", output_repository));
 
@@ -675,7 +981,7 @@ generator_sync_package :: (
     );
     if !File_Utilities.copy_directory(package_directory, output_repository)
         generator_error(tprint("could not synchronize package into %", output_repository));
-    print("Generated % into %.\n", port.name, port.output_repository);
+    print("Generated % into %.\n", port.name, generator_output_repository_relative(port));
 }
 
 generator_check_package :: (
@@ -683,7 +989,7 @@ generator_check_package :: (
     port: *Port_Spec,
     package_directory: string,
 ) {
-    output_repository := tprint("%/%", root, port.output_repository);
+    output_repository := generator_output_repository_path(root, port);
     comparison := translator_process_run_output(
         string.["diff", "-ruN", "--exclude=.git", "--exclude=.build",
                 package_directory, output_repository],
@@ -701,7 +1007,10 @@ generator_check_package :: (
     if comparison.output.count write_string(comparison.output, to_standard_error = true);
     if comparison.error.count write_string(comparison.error, to_standard_error = true);
     if comparison.process.exit_code == 1
-        generator_error(tprint("% differs from its reproducible package", port.output_repository));
+        generator_error(tprint(
+            "% differs from its reproducible package",
+            generator_output_repository_relative(port),
+        ));
     generator_error("diff failed while checking generated package");
 }
 
@@ -725,8 +1034,8 @@ generator_require_recorded_publish_metadata :: (
         parsed.error.message,
     ));
     defer json_free(parsed.value);
-    if json_get_int(parsed.value, "schema_version") != 2
-        generator_error(tprint("% does not use PORT.json schema 2", metadata_path));
+    if json_get_int(parsed.value, "schema_version") != 3
+        generator_error(tprint("% does not use PORT.json schema 3", metadata_path));
 
     upstream := json_get_object(parsed.value, "upstream");
     if upstream == null || json_get_string(upstream, "commit") != port.upstream_commit
@@ -872,7 +1181,43 @@ generator_require_inputs_unchanged :: (
         );
 }
 
-generator_require_output_current :: (root: string, output_repository: string) {
+generator_require_output_current :: (
+    root: string,
+    output_repository: string,
+) -> bool {
+    generator_run_checked(
+        string.["git", "-C", output_repository, "fetch", "--quiet", "--prune"],
+        root,
+        "fetch output upstream",
+    );
+
+    head, has_head := generator_try_capture(
+        string.["git", "-C", output_repository, "rev-parse", "--verify", "HEAD"],
+        root,
+    );
+    defer port_owned_string_drop(*head);
+    if !has_head {
+        remote_heads := generator_run_capture(
+            string.["git", "-C", output_repository, "ls-remote", "--heads", "origin"],
+            root,
+            "inspect empty output remote",
+        );
+        defer port_owned_string_drop(*remote_heads);
+        if generator_trim_line_endings(remote_heads).count
+            generator_error(
+                "output repository has no local commit, but origin has branches; check out its default branch first",
+            );
+
+        branch, has_branch := generator_try_capture(
+            string.["git", "-C", output_repository, "symbolic-ref", "--quiet", "--short", "HEAD"],
+            root,
+        );
+        defer port_owned_string_drop(*branch);
+        if !has_branch || !generator_trim_line_endings(branch).count
+            generator_error("empty output repository has no branch for its initial commit");
+        return true;
+    }
+
     upstream, has_upstream := generator_try_capture(
         string.[
             "git", "-C", output_repository, "rev-parse", "--abbrev-ref",
@@ -884,17 +1229,6 @@ generator_require_output_current :: (root: string, output_repository: string) {
     if !has_upstream generator_error(
         "output branch has no upstream; configure it before publishing",
     );
-    generator_run_checked(
-        string.["git", "-C", output_repository, "fetch", "--quiet", "--prune"],
-        root,
-        "fetch output upstream",
-    );
-    head := generator_run_capture(
-        string.["git", "-C", output_repository, "rev-parse", "HEAD"],
-        root,
-        "read output HEAD",
-    );
-    defer port_owned_string_drop(*head);
     remote_head := generator_run_capture(
         string.["git", "-C", output_repository, "rev-parse", "@{upstream}"],
         root,
@@ -906,6 +1240,7 @@ generator_require_output_current :: (root: string, output_repository: string) {
             "output HEAD must exactly match its upstream % before publishing",
             generator_trim_line_endings(upstream),
         ));
+    return false;
 }
 
 generator_commit_package :: (
@@ -913,6 +1248,7 @@ generator_commit_package :: (
     port: *Port_Spec,
     output_repository: string,
     provenance: *Generator_Provenance,
+    initial_publication: bool,
 ) {
     generator_run_checked(
         string.[
@@ -959,6 +1295,21 @@ generator_commit_package :: (
         "Published % as local commit %\n",
         port.name, generator_trim_line_endings(committed),
     );
+    if initial_publication {
+        branch := generator_run_capture(
+            string.[
+                "git", "-C", output_repository, "symbolic-ref", "--quiet",
+                "--short", "HEAD",
+            ],
+            root,
+            tprint("read % output branch", port.name),
+        );
+        defer port_owned_string_drop(*branch);
+        print(
+            "First publication: push it and configure its upstream with:\n  git -C % push --set-upstream origin %\n",
+            generator_output_repository_relative(port), generator_trim_line_endings(branch),
+        );
+    }
 }
 
 generator_build_package :: (
@@ -967,23 +1318,143 @@ generator_build_package :: (
     options: Generator_Options,
     provenance: *Generator_Provenance,
 ) -> string {
+    if !port.modules.count generator_error(tprint("% defines no modules", port.name));
+    for *module, module_index: port.modules {
+        if module.output_path.count
+            generator_require_managed_relative_path(module.output_path, "module output path");
+        if !module.transpiler_prefix.count generator_error(tprint(
+            "% module % has no transpiler prefix", port.name, module_index,
+        ));
+        explicit_sources := module.source_files.count + module.generator_source_files.count;
+        for group: module.source_groups explicit_sources += group.source_files.count;
+        if !explicit_sources && !module.cmake_targets.count && !module.make_targets.count generator_error(tprint(
+            "% module % has no source files", port.name, module.transpiler_prefix,
+        ));
+        if (explicit_sources && (module.cmake_targets.count || module.make_targets.count)) ||
+           (module.cmake_targets.count && module.make_targets.count)
+            generator_error("a module must select exactly one of explicit sources, CMake or Make targets");
+        if module.cmake_targets.count && !port.cmake.enabled
+            generator_error("CMake target selection requires CMake preparation");
+        if module.make_targets.count && !port.make.enabled
+            generator_error("Make target selection requires Make preparation");
+        generator_require_managed_relative_path(module.generated_entry, "generated entry");
+        for *other, other_index: port.modules {
+            if other_index >= module_index break;
+            if other.output_path == module.output_path generator_error(tprint(
+                "% has duplicate module output path: %", port.name, module.output_path,
+            ));
+        }
+    }
+
     source_root := generator_prepare_upstream(root, port, options.offline);
+    generator_prepare_submodules(root, source_root, port.submodules, options.offline);
+    for dependency, index: port.dependencies {
+        generator_require_managed_relative_path(dependency.name, "dependency name");
+        for byte: dependency.name if byte == #char "/"
+            generator_error("dependency names must be single path components");
+        if dependency.name == port.name generator_error("dependency name equals the port name");
+        for other, other_index: port.dependencies {
+            if other_index >= index break;
+            if other.name == dependency.name generator_error("duplicate dependency name");
+        }
+        generator_require_managed_relative_path(dependency.license_file, "dependency license");
+        dependency_port := Port_Spec.{
+            name = dependency.name,
+            upstream_url = dependency.upstream_url,
+            upstream_commit = dependency.upstream_commit,
+        };
+        generator_prepare_upstream(root, *dependency_port, options.offline);
+    }
     work_directory := tprint("%/.work/%", root, port.name);
     if compat_path_exists(work_directory) && !File.delete_directory(work_directory)
         generator_error(tprint("could not clear managed work directory: %", work_directory));
     assert(File.make_directory_if_it_does_not_exist(work_directory, recursive = true));
+    prepared_include_directory := "";
+    if port.prepared_files.count {
+        prepared_include_directory = tprint("%/include", work_directory);
+        for prepared, index: port.prepared_files {
+            generator_require_managed_relative_path(prepared.destination, "prepared header destination");
+            for other, other_index: port.prepared_files {
+                if other_index >= index break;
+                if other.destination == prepared.destination generator_error("duplicate prepared header destination");
+            }
+            source := generator_resolve_source_path(source_root, port, prepared.source);
+            contents, ok := File.read_entire_file(source);
+            if !ok generator_error(tprint("could not read prepared header source: %", source));
+            defer free(contents.data);
+            destination := tprint("%/%", prepared_include_directory, prepared.destination);
+            parent := compat_path_parent(destination);
+            assert(parent.has_value);
+            assert(File.make_directory_if_it_does_not_exist(parent.value, recursive = true));
+            if !File.write_entire_file(destination, contents)
+                generator_error(tprint("could not write prepared header: %", destination));
+        }
+    }
 
-    compile_database := tprint("%/compile_commands.json", work_directory);
-    transpiled_directory := tprint("%/transpiled", work_directory);
-    package_directory := tprint("%/package/%", work_directory, port.name);
-    verification_directory := tprint("%/verify", work_directory);
-    generator_write_compile_database(compile_database, source_root, port);
-    generator_transpile(root, port, compile_database, transpiled_directory);
-    generator_assemble_package(
-        root, port, source_root, transpiled_directory, package_directory,
-        provenance,
+    cmake_directory := "";
+    link_targets: [..] string;
+    defer array_free(link_targets);
+    for module: port.modules for target: module.cmake_targets {
+        duplicate := false;
+        for existing: link_targets if existing == target { duplicate = true; break; }
+        if !duplicate array_add(*link_targets, target);
+    }
+    if port.cmake.enabled cmake_directory = generator_prepare_cmake(
+        root, source_root, work_directory, *port.cmake, link_targets, port,
     );
-    generator_verify_package(root, port, package_directory, verification_directory);
+    if port.cmake.enabled && port.make.enabled generator_error("a port cannot configure both CMake and Make");
+    make_directory := "";
+    if port.make.enabled make_directory = generator_prepare_make(root, source_root, work_directory, port);
+    package_directory := tprint("%/package/%", work_directory, port.name);
+    for *module: port.modules {
+        work_name := ifx module.output_path.count
+            then module.output_path else "_root";
+        module_work_directory := tprint("%/modules/%", work_directory, work_name);
+        assert(File.make_directory_if_it_does_not_exist(
+            module_work_directory, recursive = true,
+        ));
+        compile_database := tprint("%/compile_commands.json", module_work_directory);
+        transpiled_directory := tprint("%/transpiled", module_work_directory);
+        module_directory := ifx module.output_path.count
+            then tprint("%/%", package_directory, module.output_path)
+            else package_directory;
+        if module.cmake_targets.count generator_write_cmake_compile_database(
+            compile_database, cmake_directory, module.cmake_targets,
+        );
+        else if module.make_targets.count generator_write_make_compile_database(
+            root, compile_database, make_directory, port, module,
+        );
+        else generator_write_compile_database(
+            compile_database, source_root, port, module, prepared_include_directory,
+        );
+        system_manifest := tprint("%/system-libraries.json", module_work_directory);
+        generator_resolve_system_libraries_native(
+            system_manifest, module.system_libraries,
+            ifx module.cmake_targets.count then cmake_directory else "",
+            module.cmake_targets,
+        );
+        generator_transpile(root, port, module, compile_database, transpiled_directory,
+            prepared_include_directory, system_manifest);
+        generator_assemble_module(
+            port, module, source_root, transpiled_directory, module_directory,
+        );
+        library_metadata, library_metadata_ok := File.read_entire_file(system_manifest);
+        if !library_metadata_ok generator_error("system library metadata disappeared");
+        defer free(library_metadata.data);
+        assert(File.write_entire_file(tprint("%/SYSTEM_LIBRARIES.json", module_directory), library_metadata));
+    }
+
+    generator_assemble_package_files(
+        port, source_root, package_directory, provenance,
+    );
+    for *module: port.modules {
+        work_name := ifx module.output_path.count
+            then module.output_path else "_root";
+        test_directory := tprint("%/test/%", work_directory, work_name);
+        generator_test_module(
+            root, port, module, package_directory, test_directory,
+        );
+    }
     return package_directory;
 }
 
@@ -1003,6 +1474,18 @@ generator_generate :: (port_name: string, options: Generator_Options) {
         defer port_owned_string_drop(*status);
         if status.count print("Dirty generator inputs:\n%", status);
     }
+}
+
+// Validate a new recipe without requiring a published output repository.
+generator_validate :: (port_name: string, options: Generator_Options) {
+    port, found := generator_find_port(port_name);
+    if !found generator_error(tprint("unknown port: %", port_name));
+    root := generator_repository_root();
+    provenance := generator_read_provenance(root);
+    defer deinit(*provenance);
+    package_directory := generator_build_package(root, *port, options, *provenance);
+    print("Validated % recipe. Package: %\n", port.name, package_directory);
+    print("Recipe tests do not establish full parity or performance; use differential checks for those.\n");
 }
 
 generator_check :: (port_name: string, options: Generator_Options) {
@@ -1028,7 +1511,7 @@ generator_publish :: (port_name: string, options: Generator_Options) {
     );
     provenance := generator_require_publishable_inputs(root);
     defer deinit(*provenance);
-    generator_require_output_current(root, output_repository);
+    initial_publication := generator_require_output_current(root, output_repository);
 
     package_directory := generator_build_package(
         root, *port, options, *provenance,
@@ -1037,6 +1520,6 @@ generator_publish :: (port_name: string, options: Generator_Options) {
     generator_check_package(root, *port, package_directory);
     generator_require_inputs_unchanged(root, *provenance);
     generator_commit_package(
-        root, *port, output_repository, *provenance,
+        root, *port, output_repository, *provenance, initial_publication,
     );
 }

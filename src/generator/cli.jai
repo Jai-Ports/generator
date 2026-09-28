@@ -5,13 +5,15 @@ Jai Ports generator
 Usage:
   generator list
   generator <port> [--offline]
+  generator validate <port> [--offline]
   generator check <port> [--offline]
   generator publish <port> [--offline]
 
 Commands:
   list       List available typed port recipes.
-  check      Build and verify, then fail if the output repository differs.
-  publish    Require clean pushed inputs, verify, and commit generated output.
+  validate   Build and run tests locally, without an output repository.
+  check      Build and test, then fail if the output repository differs.
+  publish    Require clean pushed inputs, test, and commit generated output.
 
 Options:
   --offline  Do not fetch upstream source; require its pinned commit locally.
@@ -27,6 +29,14 @@ generator_cli_main :: () {
     }
 
     command := command_line[1];
+    if command == "__system-libraries" {
+        generator_internal_system_libraries(command_line);
+        return;
+    }
+    if command == "__make-sources" {
+        generator_internal_make_sources(command_line);
+        return;
+    }
     if command == "help" || command == "--help" || command == "-h" {
         generator_print_help();
         return;
@@ -38,7 +48,7 @@ generator_cli_main :: () {
     }
     port_name: string;
     option_start: int;
-    if command == "check" || command == "publish" {
+    if command == "check" || command == "publish" || command == "validate" {
         if command_line.count < 3 generator_error(tprint("% requires a port name", command));
         port_name = command_line[2];
         option_start = 3;
@@ -58,6 +68,7 @@ generator_cli_main :: () {
     }
 
     if command == "port" generator_generate(port_name, options);
+    else if command == "validate" generator_validate(port_name, options);
     else if command == "check" generator_check(port_name, options);
     else generator_publish(port_name, options);
 }
