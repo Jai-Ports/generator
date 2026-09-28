@@ -856,6 +856,7 @@ generator_test_module :: (
     module: *Port_Module_Spec,
     package_directory: string,
     test_directory: string,
+    library_manifest: string,
 ) {
     assert(File.make_directory_if_it_does_not_exist(test_directory, recursive = true));
     test_name := tprint(
@@ -880,9 +881,6 @@ generator_test_module :: (
     module_parent := compat_path_parent(package_directory);
     if !module_parent.has_value
         generator_error(tprint("module package has no parent directory: %", package_directory));
-    module_directory := ifx module.output_path.count
-        then tprint("%/%", package_directory, module.output_path) else package_directory;
-    library_manifest := tprint("%/SYSTEM_LIBRARIES.json", module_directory);
     test_environment := generator_test_environment(library_manifest);
     defer generator_test_environment_deinit(*test_environment);
     launch: [..] string;
@@ -1438,10 +1436,6 @@ generator_build_package :: (
         generator_assemble_module(
             port, module, source_root, transpiled_directory, module_directory,
         );
-        library_metadata, library_metadata_ok := File.read_entire_file(system_manifest);
-        if !library_metadata_ok generator_error("system library metadata disappeared");
-        defer free(library_metadata.data);
-        assert(File.write_entire_file(tprint("%/SYSTEM_LIBRARIES.json", module_directory), library_metadata));
     }
 
     generator_assemble_package_files(
@@ -1453,6 +1447,7 @@ generator_build_package :: (
         test_directory := tprint("%/test/%", work_directory, work_name);
         generator_test_module(
             root, port, module, package_directory, test_directory,
+            tprint("%/modules/%/system-libraries.json", work_directory, work_name),
         );
     }
     return package_directory;
